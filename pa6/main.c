@@ -637,9 +637,6 @@ int pa6_main(int argc, char **argv)
         }
         if (child_pid == 0) {
             state.ipc.id = (local_id) from;
-            if (dup2(STDOUT_FILENO, STDERR_FILENO) < 0) {
-                _exit(1);
-            }
             close_unused_pipes(&state);
             if (child_run(&state) != 0) {
                 close_all_pipes(pipes, process_count);
