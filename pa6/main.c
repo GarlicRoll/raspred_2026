@@ -17,20 +17,15 @@
 timestamp_t get_physical_time(void);
 
 typedef struct {
-    timestamp_t timestamp;
-    local_id id;
-} request_entry;
-
-typedef struct {
     ipc_context ipc;
     int child_count;
     int mutex_enabled;
-    int logical_time;
-    request_entry requests[MAX_PROCESS_COUNT];
-    int request_count;
-    int waiting_for_replies;
-    int reply_received[MAX_PROCESS_COUNT];
-    int reply_count;
+    unsigned char has_fork[MAX_PROCESS_COUNT];
+    unsigned char dirty_fork[MAX_PROCESS_COUNT];
+    unsigned char deferred_request[MAX_PROCESS_COUNT];
+    unsigned char requested_fork[MAX_PROCESS_COUNT];
+    int hungry;
+    int eating;
     int started[MAX_PROCESS_COUNT];
     int started_count;
     int done[MAX_PROCESS_COUNT];
@@ -126,8 +121,8 @@ static void close_unused_pipes(process_state *state)
             if (from == to) {
                 continue;
             }
-            keep_write = state->ipc.id != PARENT_ID && from == state->ipc.id;
-            keep_read = to == state->ipc.id && from != PARENT_ID;
+            keep_write = from == state->ipc.id;
+            keep_read = to == state->ipc.id;
             if (!keep_read && state->ipc.pipes[from][to][0] >= 0) {
                 close(state->ipc.pipes[from][to][0]);
                 state->ipc.pipes[from][to][0] = -1;
@@ -168,76 +163,106 @@ static int log_pipes(int fd,
     return 0;
 }
 
-static timestamp_t next_logical_time(process_state *state)
+static local_id fork_neighbor(const process_state *state, int edge)
 {
-    ++state->logical_time;
-    return (timestamp_t) state->logical_time;
+    if (edge < 1 || edge > state->child_count || edge == state->ipc.id) {
+        return -1;
+    }
+    return (local_id) edge;
 }
 
-static int request_order(timestamp_t left_time, local_id left_id,
-                         timestamp_t right_time, local_id right_id)
-{
-    if (left_time != right_time) {
-        return left_time < right_time;
-    }
-    return left_id < right_id;
-}
-
-static void insert_request(process_state *state, local_id id,
-                           timestamp_t timestamp)
-{
-    int index;
-
-    for (index = 0; index < state->request_count; ++index) {
-        if (state->requests[index].id == id) {
-            state->requests[index].timestamp = timestamp;
-            break;
-        }
-    }
-    if (index == state->request_count) {
-        ++state->request_count;
-    }
-    state->requests[index].id = id;
-    state->requests[index].timestamp = timestamp;
-
-    while (index > 0 &&
-           request_order(state->requests[index].timestamp,
-                         state->requests[index].id,
-                         state->requests[index - 1].timestamp,
-                         state->requests[index - 1].id)) {
-        request_entry temporary = state->requests[index - 1];
-        state->requests[index - 1] = state->requests[index];
-        state->requests[index] = temporary;
-        --index;
-    }
-}
-
-static void remove_request(process_state *state, local_id id)
-{
-    int index;
-
-    for (index = 0; index < state->request_count; ++index) {
-        if (state->requests[index].id == id) {
-            int next;
-
-            for (next = index + 1; next < state->request_count; ++next) {
-                state->requests[next - 1] = state->requests[next];
-            }
-            --state->request_count;
-            return;
-        }
-    }
-}
-
-static int send_control(process_state *state, local_id destination,
-                        MessageType type, timestamp_t time)
+static int send_fork_message(process_state *state, local_id destination,
+                             MessageType type)
 {
     Message msg;
+    char payload[2];
 
-    if (make_message(&msg, type, time, NULL) != 0) {
+    payload[0] = (char) state->ipc.id;
+    payload[1] = '\0';
+    if (make_message(&msg, type, 0, payload) != 0) {
         return -1;
     }
     return send(&state->ipc, destination, &msg);
+}
+
+static int request_fork(process_state *state, int edge)
+{
+    local_id neighbor = fork_neighbor(state, edge);
+
+    if (!state->hungry || state->has_fork[edge] ||
+        state->requested_fork[edge]) {
+        return 0;
+    }
+    if (neighbor <= PARENT_ID || neighbor == state->ipc.id ||
+        send_fork_message(state, neighbor, CS_REQUEST) != 0) {
+        return -1;
+    }
+    state->requested_fork[edge] = 1;
+    return 0;
+}
+
+static int request_missing_forks(process_state *state)
+{
+    int peer;
+
+    for (peer = 1; peer <= state->child_count; ++peer) {
+        if (peer != state->ipc.id && request_fork(state, peer) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int has_all_forks(const process_state *state)
+{
+    int peer;
+
+    for (peer = 1; peer <= state->child_count; ++peer) {
+        if (peer != state->ipc.id && !state->has_fork[peer]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int send_deferred_fork(process_state *state, int edge)
+{
+    local_id neighbor = fork_neighbor(state, edge);
+
+    if (!state->deferred_request[edge] || !state->has_fork[edge] ||
+        !state->dirty_fork[edge] || state->eating) {
+        return 0;
+    }
+    if (neighbor <= PARENT_ID || neighbor == state->ipc.id ||
+        send_fork_message(state, neighbor, CS_REPLY) != 0) {
+        return -1;
+    }
+    state->has_fork[edge] = 0;
+    state->dirty_fork[edge] = 0;
+    state->deferred_request[edge] = 0;
+    return 0;
+}
+
+static int service_deferred_forks(process_state *state)
+{
+    int edge;
+
+    for (edge = 1; edge <= state->child_count; ++edge) {
+        if (send_deferred_fork(state, edge) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void initialize_forks(process_state *state)
+{
+    int edge;
+
+    for (edge = 1; edge <= state->child_count; ++edge) {
+        state->has_fork[edge] = state->ipc.id < edge;
+        state->dirty_fork[edge] = state->has_fork[edge];
+    }
 }
 
 static int log_received_all_started(process_state *state)
@@ -303,25 +328,32 @@ static int handle_message(process_state *state, const Message *msg)
         return log_received_all_done(state);
     }
     if (type == CS_REQUEST) {
-        timestamp_t remote_time = msg->s_header.s_local_time;
+        int edge;
 
-        if (remote_time > state->logical_time) {
-            state->logical_time = remote_time;
+        if (msg->s_header.s_payload_len != 1) {
+            return -1;
         }
-        next_logical_time(state);
-        insert_request(state, from, remote_time);
-        return send_control(state, from, CS_REPLY,
-                            (timestamp_t) state->logical_time);
+        edge = (unsigned char) msg->s_payload[0];
+        if (fork_neighbor(state, edge) != from) {
+            return -1;
+        }
+        state->deferred_request[edge] = 1;
+        return send_deferred_fork(state, edge);
     }
     if (type == CS_REPLY) {
-        if (state->waiting_for_replies && !state->reply_received[from]) {
-            state->reply_received[from] = 1;
-            ++state->reply_count;
+        int edge;
+
+        if (msg->s_header.s_payload_len != 1) {
+            return -1;
         }
-        return 0;
-    }
-    if (type == CS_RELEASE) {
-        remove_request(state, from);
+        edge = (unsigned char) msg->s_payload[0];
+        if (fork_neighbor(state, edge) != from ||
+            !state->requested_fork[edge] || state->has_fork[edge]) {
+            return -1;
+        }
+        state->requested_fork[edge] = 0;
+        state->has_fork[edge] = 1;
+        state->dirty_fork[edge] = 0;
         return 0;
     }
     return -1;
@@ -340,62 +372,44 @@ static int receive_and_handle(process_state *state)
 int request_cs(const void *self)
 {
     process_state *state = (process_state *) self;
-    Message msg;
-    timestamp_t timestamp;
-    int destination;
 
     if (state == NULL || state->ipc.id == PARENT_ID ||
         !state->mutex_enabled) {
         return -1;
     }
-    timestamp = next_logical_time(state);
-    insert_request(state, state->ipc.id, timestamp);
-    memset(state->reply_received, 0, sizeof(state->reply_received));
-    state->reply_count = 0;
-    state->waiting_for_replies = 1;
-    if (make_message(&msg, CS_REQUEST, timestamp, NULL) != 0) {
+    state->hungry = 1;
+    if (request_missing_forks(state) != 0) {
+        state->hungry = 0;
         return -1;
     }
-    for (destination = 1; destination < state->ipc.process_count;
-         ++destination) {
-        if (destination != state->ipc.id &&
-            send(&state->ipc, (local_id) destination, &msg) != 0) {
+    while (!has_all_forks(state)) {
+        if (receive_and_handle(state) != 0 ||
+            request_missing_forks(state) != 0) {
+            state->hungry = 0;
             return -1;
         }
     }
-
-    while (state->reply_count < state->child_count - 1 ||
-           state->request_count == 0 ||
-           state->requests[0].id != state->ipc.id) {
-        if (receive_and_handle(state) != 0) {
-            return -1;
-        }
-    }
-    state->waiting_for_replies = 0;
+    state->eating = 1;
     return 0;
 }
 
 int release_cs(const void *self)
 {
     process_state *state = (process_state *) self;
-    timestamp_t timestamp;
-    int destination;
+    int edge;
 
     if (state == NULL || state->ipc.id == PARENT_ID ||
-        !state->mutex_enabled) {
+        !state->mutex_enabled || !state->eating) {
         return -1;
     }
-    remove_request(state, state->ipc.id);
-    timestamp = next_logical_time(state);
-    for (destination = 1; destination < state->ipc.process_count;
-         ++destination) {
-        if (destination != state->ipc.id &&
-            send_control(state, (local_id) destination, CS_RELEASE,
-                         timestamp) != 0) {
-            return -1;
+    state->eating = 0;
+    state->hungry = 0;
+    for (edge = 1; edge <= state->child_count; ++edge) {
+        if (state->has_fork[edge]) {
+            state->dirty_fork[edge] = 1;
         }
     }
-    return 0;
+    return service_deferred_forks(state);
 }
 
 static int child_run(process_state *state)
@@ -406,6 +420,7 @@ static int child_run(process_state *state)
     int iteration;
     int iterations = (int) state->ipc.id * 5;
 
+    initialize_forks(state);
     timestamp = get_physical_time();
     if (snprintf(line, sizeof(line), log_started_fmt, (int) timestamp,
                  (int) state->ipc.id, (int) getpid(), (int) getppid(),

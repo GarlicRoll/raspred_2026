@@ -73,6 +73,9 @@ static int read_from(ipc_context *context, local_id from, Message *msg)
 {
     int fd = context->pipes[from][context->id][0];
 
+    if (context->closed[from]) {
+        return 2;
+    }
     if (context->expected[from] == 0) {
         context->expected[from] = sizeof(MessageHeader);
     }
@@ -103,6 +106,10 @@ static int read_from(ipc_context *context, local_id from, Message *msg)
                 return 1;
             }
         } else if (result == 0) {
+            if (context->received[from] == 0) {
+                context->closed[from] = 1;
+                return 2;
+            }
             return -1;
         } else if (errno == EINTR) {
             continue;
@@ -126,8 +133,11 @@ int receive(void *self, local_id from, Message *msg)
     for (;;) {
         int result = read_from(context, from, msg);
 
+        if (result == 1) {
+            return 0;
+        }
         if (result != 0) {
-            return result < 0 ? -1 : 0;
+            return -1;
         }
         short_delay();
     }
@@ -143,6 +153,7 @@ int receive_any(void *self, Message *msg)
     }
     for (;;) {
         int from;
+        int open_sources = 0;
 
         for (from = 0; from < context->process_count; ++from) {
             int result;
@@ -155,9 +166,15 @@ int receive_any(void *self, Message *msg)
             if (result < 0) {
                 return -1;
             }
-            if (result > 0) {
+            if (result == 1) {
                 return 0;
             }
+            if (result == 0) {
+                ++open_sources;
+            }
+        }
+        if (open_sources == 0) {
+            return -1;
         }
         short_delay();
     }

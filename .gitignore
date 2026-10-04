@@ -1,3 +1,5 @@
 *.tar.gz
 *.out
 *.log
+pa6_results*
+pa6/pa6

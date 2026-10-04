@@ -12,6 +12,7 @@ typedef struct {
     unsigned char input[MAX_PROCESS_COUNT][MAX_MESSAGE_LEN];
     size_t received[MAX_PROCESS_COUNT];
     size_t expected[MAX_PROCESS_COUNT];
+    unsigned char closed[MAX_PROCESS_COUNT];
     local_id last_from;
 } ipc_context;
 
